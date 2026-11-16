@@ -34,6 +34,8 @@ type Raft struct {
 	log                             []LogEntry // Index zero is a sentinel.
 	commitIndex, lastApplied        int
 	matchIndex                      []int
+	nextIndex                       []int
+	replicating                     []bool // One in-flight AppendEntries per follower in this term.
 	electionDeadline, nextHeartbeat time.Time
 	applyReady                      *sync.Cond
 	applyCh                         chan ApplyMsg
@@ -58,8 +60,9 @@ type AppendEntriesArgs struct {
 	LeaderCommit                              int
 }
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
 }
 
 func (rf *Raft) resetElectionLocked() {
@@ -95,8 +98,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.role = follower
 	rf.resetElectionLocked()
-	// Member 2: check the prefix and reconcile entries here. On success call
-	// advanceFollowerCommitLocked(args.LeaderCommit, args.PrevLogIndex+len(args.Entries)).
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.ConflictIndex = len(rf.log)
+		return
+	}
+	if term := rf.log[args.PrevLogIndex].Term; term != args.PrevLogTerm {
+		first := args.PrevLogIndex
+		for first > 0 && rf.log[first-1].Term == term {
+			first--
+		}
+		reply.ConflictIndex = first
+		return
+	}
+	for offset, entry := range args.Entries {
+		index := args.PrevLogIndex + 1 + offset
+		if index == len(rf.log) || rf.log[index].Term != entry.Term {
+			rf.log = append(rf.log[:index], args.Entries[offset:]...)
+			break
+		}
+	}
+	rf.advanceFollowerCommitLocked(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+	reply.Success = true
 }
 func (rf *Raft) startElectionLocked() {
 	rf.role = candidate
@@ -135,24 +157,67 @@ func (rf *Raft) startElectionLocked() {
 func (rf *Raft) becomeLeaderLocked() {
 	rf.role = leader
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.replicating = make([]bool, len(rf.peers))
+	for peer := range rf.peers {
+		rf.nextIndex[peer] = len(rf.log)
+	}
+	rf.matchIndex[rf.me] = len(rf.log) - 1
 	rf.heartbeatLocked()
 }
 func (rf *Raft) heartbeatLocked() {
 	rf.nextHeartbeat = time.Now().Add(110 * time.Millisecond)
-	last := len(rf.log) - 1
-	args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex: last, PrevLogTerm: rf.log[last].Term, LeaderCommit: rf.commitIndex}
+	rf.scheduleReplicationLocked()
+}
+
+func (rf *Raft) scheduleReplicationLocked() {
 	for peer := range rf.peers {
-		if peer == rf.me {
+		if peer == rf.me || rf.replicating[peer] {
 			continue
 		}
-		go func(peer int) {
-			var reply AppendEntriesReply
-			if rf.sendAppendEntries(peer, &args, &reply) {
-				rf.mu.Lock()
-				rf.observeTermLocked(reply.Term)
-				rf.mu.Unlock()
-			}
-		}(peer)
+		rf.replicating[peer] = true
+		go rf.replicate(peer, rf.currentTerm)
+	}
+}
+
+func (rf *Raft) replicate(peer, term int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for !rf.stopped && rf.role == leader && rf.currentTerm == term {
+		next := rf.nextIndex[peer]
+		args := AppendEntriesArgs{
+			Term: term, LeaderId: rf.me, PrevLogIndex: next - 1,
+			PrevLogTerm: rf.log[next-1].Term, LeaderCommit: rf.commitIndex,
+			Entries: append([]LogEntry(nil), rf.log[next:]...),
+		}
+		rf.mu.Unlock()
+		var reply AppendEntriesReply
+		ok := rf.sendAppendEntries(peer, &args, &reply)
+		rf.mu.Lock()
+		if ok {
+			rf.observeTermLocked(reply.Term)
+		}
+		// A new leader term owns a fresh set of progress and in-flight flags.
+		if rf.stopped || rf.role != leader || rf.currentTerm != term {
+			return
+		}
+		if !ok {
+			break // The next heartbeat or command retries this follower.
+		}
+		if !reply.Success {
+			rf.nextIndex[peer] = max(1, reply.ConflictIndex)
+			continue
+		}
+		matched := args.PrevLogIndex + len(args.Entries)
+		rf.matchIndex[peer] = matched
+		rf.nextIndex[peer] = matched + 1
+		rf.advanceLeaderCommitLocked()
+		if rf.nextIndex[peer] == len(rf.log) {
+			break
+		}
+	}
+	if rf.currentTerm == term {
+		rf.replicating[peer] = false
 	}
 }
 func (rf *Raft) tick() {
@@ -235,8 +300,19 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return rf.peers[server].Call("Raft.AppendEntries", args, reply)
 }
 
-// Start is the Member 2 replication entry point.
-func (rf *Raft) Start(command interface{}) (int, int, bool) { return -1, -1, false }
+func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.stopped || rf.role != leader {
+		return -1, rf.currentTerm, false
+	}
+	index := len(rf.log)
+	rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm})
+	rf.matchIndex[rf.me] = index
+	rf.advanceLeaderCommitLocked()
+	rf.scheduleReplicationLocked()
+	return index, rf.currentTerm, true
+}
 func (rf *Raft) Kill() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
