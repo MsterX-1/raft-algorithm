@@ -33,6 +33,13 @@ Run the tests with Go's race detector:
 ```text
 go test -race ./...
 ```
+``````````````````````
+$env:Path = "G:\msys64\ucrt64\bin;$env:Path"
+$env:CC = "G:\msys64\ucrt64\bin\gcc.exe"
+$env:GOCACHE = "G:\GoCache"
+$env:GOTMPDIR = "G:\GoTemp"
+go test -race -count=1 ./...
+``````````````````````
 
 ## Scope
 

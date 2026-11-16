@@ -67,7 +67,7 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) resetElectionLocked() {
 	rf.electionDeadline = time.Now().Add(time.Duration(150+rand.Intn(151)) * time.Millisecond)
-}
+}//150,151
 func (rf *Raft) observeTermLocked(term int) {
 	if term > rf.currentTerm {
 		rf.currentTerm, rf.votedFor, rf.role = term, -1, follower
@@ -166,8 +166,38 @@ func (rf *Raft) becomeLeaderLocked() {
 	rf.heartbeatLocked()
 }
 func (rf *Raft) heartbeatLocked() {
-	rf.nextHeartbeat = time.Now().Add(110 * time.Millisecond)
-	rf.scheduleReplicationLocked()
+    rf.nextHeartbeat = time.Now().Add(110 * time.Millisecond)
+
+    for peer := range rf.peers {
+        if peer == rf.me || !rf.replicating[peer] {
+            continue
+        }
+
+        // A replication RPC is still pending. Send this follower
+        // a heartbeat using the last prefix it confirmed.
+        prev := rf.matchIndex[peer]
+        args := AppendEntriesArgs{
+            Term:         rf.currentTerm,
+            LeaderId:     rf.me,
+            PrevLogIndex: prev,
+            PrevLogTerm:  rf.log[prev].Term,
+            LeaderCommit: rf.commitIndex,
+        }
+
+        go func(peer int, args AppendEntriesArgs) {
+            var reply AppendEntriesReply
+            if !rf.sendAppendEntries(peer, &args, &reply) {
+                return
+            }
+
+            rf.mu.Lock()
+            defer rf.mu.Unlock()
+            rf.observeTermLocked(reply.Term)
+        }(peer, args)
+    }
+
+    // Followers with no pending RPC use the existing replication path.
+    rf.scheduleReplicationLocked()
 }
 
 func (rf *Raft) scheduleReplicationLocked() {
@@ -243,7 +273,6 @@ func (rf *Raft) tick() {
 	}
 }
 
-// Member 2 calls this under rf.mu after a local append or matchIndex update.
 func (rf *Raft) advanceLeaderCommitLocked() {
 	if rf.role != leader {
 		return
